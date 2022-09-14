@@ -10,18 +10,19 @@ import com.github.ajalt.clikt.parameters.types.int
 import com.github.doyaaaaaken.kotlincsv.dsl.csvWriter
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.asFlow
-import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.Serializable
+import moe.sdl.parsemail.util.ModuleScope
 import mu.KotlinLogging
 import okio.buffer
 import okio.source
 import org.simplejavamail.api.email.Email
 import org.simplejavamail.converter.EmailConverter
 import java.io.File
+import java.lang.Exception
 import java.util.*
 
 private val logger = KotlinLogging.logger {}
@@ -51,11 +52,13 @@ class MainCmd : CliktCommand(name = "parse-mail") {
       System.setProperty("user.dir", it.normalize().absolutePath)
     }
 
+    val moduleScope = ModuleScope("MailReader")
     val summaries = Collections.synchronizedSet(mutableSetOf<MailSummary>())
     inputDir.walkTopDown().maxDepth(maxDepth).filter { file ->
       mailExtensions.any { file.extension.equals(it, ignoreCase = true) }
     }.asFlow().mapNotNull { file ->
-      async {
+      moduleScope.async {
+        logger.info { "Reading ${file.path}..." }
         limit.withPermit {
           val bytes by lazy(LazyThreadSafetyMode.NONE) { file.source().buffer().use { it.readByteArray() } }
           when (file.extension.lowercase()) {
@@ -65,14 +68,16 @@ class MainCmd : CliktCommand(name = "parse-mail") {
               logger.error { "Unexpected format with the file: ${file.toPath()}" }
               null
             }
-          }?.toSummary()
+          }?.toSummary(file.path)
         }
       }
-    }.catch {
-      logger.error(it) { "Failed to parse file" }
     }.collect {
-      val summary = it.await()
-      if (summary != null) summaries.add(summary)
+      try {
+        val summary = it.await()
+        if (summary != null) summaries.add(summary)
+      } catch (e: Exception) {
+        logger.error(e) { "Unexpected exception:" }
+      }
     }
 
     if (summaries.isEmpty()) {
@@ -86,6 +91,7 @@ class MainCmd : CliktCommand(name = "parse-mail") {
     outputFile.writeBytes(byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()))
     csvWriter().openAsync(outputFile, append = true) {
       writeRow(
+        "path",
         "subject",
         "fromName",
         "fromEmail",
@@ -98,6 +104,7 @@ class MainCmd : CliktCommand(name = "parse-mail") {
           logger.info { "$it" }
         }
         writeRow(
+          it.path,
           it.subject,
           it.fromName,
           it.fromEmail,
@@ -112,8 +119,9 @@ class MainCmd : CliktCommand(name = "parse-mail") {
   }
 }
 
-fun Email.toSummary() =
+fun Email.toSummary(path: String?) =
   MailSummary(
+    path = path,
     subject = subject,
     fromName = fromRecipient?.name,
     fromEmail = fromRecipient?.address,
@@ -124,6 +132,7 @@ fun Email.toSummary() =
 
 @Serializable
 data class MailSummary(
+  val path: String?,
   val subject: String?,
   val fromName: String?,
   val fromEmail: String?,
